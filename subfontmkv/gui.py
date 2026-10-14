@@ -260,15 +260,16 @@ class SubFontMKVApp(object):
     def _build_right(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="日志", padding=6)
         box.pack(fill="both", expand=True)
-        self.log_text = tk.Text(box, wrap="none", height=24, background="#1e1e1e",
+        # wrap="word"：超长的一行（mkvmerge 命令行、带完整路径的日志）会自动换行，
+        # 不再需要横向滚动；单词之间优先断行，遇到没有空格的超长路径（如中文目录）
+        # Tk 会自动退化成按字符断行，不会横向溢出。
+        self.log_text = tk.Text(box, wrap="word", height=24, background="#1e1e1e",
                                 foreground="#e0e0e0", insertbackground="#e0e0e0",
                                 font=("Consolas", 9))
         yscroll = ttk.Scrollbar(box, orient="vertical", command=self.log_text.yview)
-        xscroll = ttk.Scrollbar(box, orient="horizontal", command=self.log_text.xview)
-        self.log_text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.log_text.configure(yscrollcommand=yscroll.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
         box.rowconfigure(0, weight=1)
         box.columnconfigure(0, weight=1)
         for tag, color in (("INFO", "#e0e0e0"), ("WARNING", "#ffcc66"),
@@ -276,7 +277,7 @@ class SubFontMKVApp(object):
             self.log_text.tag_configure(tag, foreground=color)
 
         buttons = ttk.Frame(box)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(buttons, text="复制全部", command=self._copy_log).pack(side="left")
         ttk.Button(buttons, text="清空日志", command=self._clear_log).pack(side="left", padx=4)
 

@@ -33,6 +33,12 @@ demo = [
     (INFO, "  子集化字体: SubFontTest CJK.1A2B3C4D.ttf (96 字)"),
     (INFO, "封装完成: test-assets\\Show EP02.subfont.mkv"),
     (INFO, "跳过（未匹配到字幕）: NoSubtitle.mkv"),
+    # 故意放一条超长的 mkvmerge 参数行，用来展示日志自动换行
+    (INFO, "mkvmerge 参数: [--no-subtitles, --no-attachments, "
+           "H:\\软件\\SubFontMKV\\test-assets\\Show EP01.mkv, --track-name, 0:chs, "
+           "--language, 0:chi, --track-name, 0:jpn, --language, 0:jpn, "
+           "--attachment-mime-type, application/x-truetype-font, "
+           "--attach-file, SubFontTest CJK.60A1B3E9.ttf, --title, Show EP01]"),
     (INFO, "完成: 成功 2 / 试运行 0 / 跳过 1 / 失败 0"),
 ]
 app._clear_log()

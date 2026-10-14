@@ -201,20 +201,41 @@ root.update()
 assert app.log_text.yview()[0] < 0.5, "用户上翻后不应被强行拉到底部"
 print("16 日志滚动 OK（贴底才跟随，上翻不打扰）")
 
+# ---- 日志自动换行：超长行（mkvmerge 命令行 / 完整路径）不应横向溢出 ----
+app._clear_log()
+long_line = ("--no-subtitles --no-attachments H:\\软件\\SubFontMKV\\test-assets\\Show EP01.mkv "
+             "--track-name 0:chs --language 0:chi "
+             + " ".join("--attach-file 字体%02d.ttf" % str_tmpl for str_tmpl in range(20)))
+app._append_log(long_line, 20)
+root.update()
+assert app.log_text.cget("wrap") == "word", app.log_text.cget("wrap")
+disp = app.log_text.count("1.0", "end", "displaylines")[0]
+xview = app.log_text.xview()
+assert disp > 3, "超长行应换行成多行显示，实际 %d" % disp
+assert xview[0] == 0.0 and xview[1] >= 0.999, "不应再有横向溢出: %r" % (xview,)
+print("17 日志自动换行 OK（1 个逻辑行 -> %d 个显示行，无横向溢出）" % disp)
+
+# 无空格的中文长路径也要能断开
+app._clear_log()
+app._append_log("H:\\软件\\SubFontMKV\\" + "很长的中文目录名\\" * 12 + "文件.ass", 20)
+root.update()
+assert app.log_text.count("1.0", "end", "displaylines")[0] > 2, "中文长路径应能换行"
+print("18 中文长路径也能换行 OK")
+
 # ---- 批量日志插入远快于逐行（防卡顿的核心）----
 app._clear_log()
 entries = [("bulk line %d" % i, 20) for i in range(2000)]
 t0 = time.perf_counter()
 app._append_log_batch(entries)
 batch_dt = time.perf_counter() - t0
-print("17 批量写入 2000 行日志: %.3fs" % batch_dt)
+print("19 批量写入 2000 行日志: %.3fs" % batch_dt)
 assert batch_dt < 0.5, "批量写入过慢: %.3fs" % batch_dt
 
 # 界面确实能渲染（不弹窗，只做一次布局计算）
 root2 = tk.Tk(); root2.withdraw()
 app2 = gui.SubFontMKVApp(root2)
 root2.update_idletasks()
-print("18 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
+print("20 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
 root2.destroy()
 shutil.rmtree(drop_dir, ignore_errors=True)
 root.destroy()
