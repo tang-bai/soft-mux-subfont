@@ -36,6 +36,20 @@ ROW_COLORS = {
     "video": "#212121",         # 普通行
 }
 
+#: 「添加视频」区域里的拖拽提示：蓝色高亮
+DROP_HINT_COLOR = "#1565c0"
+DROP_HINT_FONT = ("Microsoft YaHei UI", 12, "bold")
+#: 拖拽悬停时整块区域的高亮底色
+DROP_HOVER_BG = "#e3f2fd"
+
+#: 日志界面里最多保留的行数。Text 控件里的行越多，每次窗口缩放的重排就越慢，
+#: 所以只留最近这些行（更早的内容仍可通过 --json 或重定向日志获取）。
+LOG_MAX_LINES = 600
+#: 队列里最多积压多少条日志，超出则丢弃并提示（防止后台狂刷日志把界面拖死）
+LOG_QUEUE_LIMIT = 4000
+#: 一次批量插入多少行日志，减少 Text 控件的重排次数
+LOG_BATCH_SIZE = 256
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -68,15 +82,24 @@ class SubFontMKVApp(object):
         self.order: List[str] = []
         self.worker: Optional[threading.Thread] = None
         self.stop_flag = threading.Event()
+        #: 当前是否处于拖拽悬停状态（避免重复设置样式）
+        self._drag_hover = False
+        #: 拖拽高亮用的控件引用，在 _build_left 里赋值
+        self._drop_box = None
+        self.tree = None  # type: ignore[assignment]
         # Tkinter 不是线程安全的：工作线程只往队列里投消息，
         # 所有界面更新都在主线程的 _drain_queues 里执行。
         self.log_queue: "queue.Queue[Tuple[str, int]]" = queue.Queue()
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._log_dropped = 0
+        self._hint_resize_job = None
+        self._pending_hint_width = None
 
         root.title("SubFontMKV — 字幕与字体软封装")
         root.geometry("1240x780")
         root.minsize(1000, 640)
 
+        self.prepare_hover_styles()
         self._build_widgets()
         add_handler(self._enqueue_log)
         root.after(100, self._drain_queues)
@@ -113,22 +136,9 @@ class SubFontMKVApp(object):
         # -- 添加视频 ---------------------------------------------------
         box = ttk.LabelFrame(parent, text="1. 添加视频", padding=6)
         box.pack(fill="both", expand=True)
+        self._drop_box = box
 
-        self.drop_hint = tk.Label(
-            box,
-            text="把视频文件或文件夹拖到这里" if HAS_DND else "拖拽不可用，请使用下方按钮添加",
-            relief="ridge", bd=1, height=2, bg="#fafafa", fg="#555555",
-        )
-        self.drop_hint.pack(fill="x", pady=(0, 6))
-        if HAS_DND:
-            for widget in (self.drop_hint, box):
-                try:
-                    widget.drop_target_register(DND_FILES)
-                    widget.dnd_bind("<<Drop>>", self._on_drop)
-                    widget.dnd_bind("<<DragEnter>>", self._on_drag_enter)
-                    widget.dnd_bind("<<DragLeave>>", self._on_drag_leave)
-                except Exception:
-                    pass
+        self._enable_drop(box)
 
         buttons = ttk.Frame(box)
         buttons.pack(fill="x")
@@ -161,6 +171,28 @@ class SubFontMKVApp(object):
         xscroll.grid(row=1, column=0, sticky="ew")
         table.rowconfigure(0, weight=1)
         table.columnconfigure(0, weight=1)
+        self._drop_scrollbars = (yscroll, xscroll)
+
+        # 拖拽提示：作为「添加视频」区域内部的空状态占位，直接占据列表所在的位置，
+        # 而不是挂在列表下面。列表里一旦有文件就换成真正的列表。
+        self.drop_hint = tk.Label(
+            table,
+            text=self._drop_hint_text(),
+            fg=DROP_HINT_COLOR,
+            font=DROP_HINT_FONT,
+            justify="center",
+            anchor="center",
+            wraplength=420,
+        )
+        self.drop_hint.grid(row=0, column=0, sticky="nsew")
+        self._hint_base_bg = self.drop_hint.cget("background")
+        self.drop_hint.bind("<Configure>", self._on_hint_resize)
+        # 初始没有视频：只显示提示，把列表先收起来
+        self._refresh_drop_hint()
+        # 提示本身不接收拖拽，让事件继续冒泡到已注册拖拽的容器
+        self._enable_drop(table)
+        self._enable_drop(self.drop_hint, register=False)
+        self._enable_drop(self.tree)
         self.tree.bind("<Delete>", lambda _e: self._remove_selected())
         self.tree.bind("<Double-1>", lambda _e: self._remove_selected())
         for key, color in ROW_COLORS.items():
@@ -252,21 +284,29 @@ class SubFontMKVApp(object):
     # 日志
     # ------------------------------------------------------------------
     def _enqueue_log(self, text: str, level: int) -> None:
+        # 后台线程狂刷日志时不要无限增长队列：这里丢弃最旧的，并留一条提示
+        if self.log_queue.qsize() >= LOG_QUEUE_LIMIT:
+            self._log_dropped += 1
+            if self._log_dropped == 1:
+                self.log_queue.put(("（日志过多，部分较早的日志已被丢弃）", WARNING))
+            return
         self.log_queue.put((text, level))
 
     def _drain_queues(self) -> None:
+        pending = []
         try:
             while True:
-                text, level = self.log_queue.get_nowait()
-                self._append_log(text, level)
+                pending.append(self.log_queue.get_nowait())
         except queue.Empty:
             pass
+        if pending:
+            self._append_log_batch(pending)
         try:
             while True:
                 self._handle_ui_event(self.ui_queue.get_nowait())
         except queue.Empty:
             pass
-        self.root.after(100, self._drain_queues)
+        self.root.after(80, self._drain_queues)
 
     def _handle_ui_event(self, event: tuple) -> None:
         kind = event[0]
@@ -279,10 +319,56 @@ class SubFontMKVApp(object):
         elif kind == "status":
             self.status_var.set(event[1])
 
+    @staticmethod
+    def _log_tag(level: int) -> str:
+        return {DEBUG: "DEBUG", INFO: "INFO", WARNING: "WARNING", ERROR: "ERROR"}.get(level, "INFO")
+
+    def _log_at_bottom(self) -> bool:
+        """日志视图当前是否贴在底部（用来决定要不要自动滚动）。"""
+        try:
+            return self.log_text.yview()[1] >= 0.999
+        except Exception:
+            return True
+
+    def _scroll_log_if_needed(self, was_at_bottom: bool) -> None:
+        # see("end") 每次调用都会触发一次滚动+重绘（约 2ms），日志密集时是大头；
+        # 而且用户往上翻看历史时不该被强行拽回底部。
+        if was_at_bottom:
+            self.log_text.see("end")
+
     def _append_log(self, text: str, level: int) -> None:
-        tag = {DEBUG: "DEBUG", INFO: "INFO", WARNING: "WARNING", ERROR: "ERROR"}.get(level, "INFO")
-        self.log_text.insert("end", text + "\n", tag)
-        self.log_text.see("end")
+        at_bottom = self._log_at_bottom()
+        self.log_text.insert("end", text + "\n", self._log_tag(level))
+        self._trim_log()
+        self._scroll_log_if_needed(at_bottom)
+
+    def _append_log_batch(self, entries: List[tuple]) -> None:
+        """一次插入多行。
+
+        Text.insert 每调用一次都会触发布局重算，逐行插入大量日志时会明显卡顿
+        （尤其是后台线程刷日志的时候），所以按批次插入。
+        """
+        # 连续同级别的行合并成一次 insert
+        at_bottom = self._log_at_bottom()
+        index = 0
+        total = len(entries)
+        while index < total:
+            level = entries[index][1]
+            tag = self._log_tag(level)
+            chunk = []
+            while index < total and entries[index][1] == level and len(chunk) < LOG_BATCH_SIZE:
+                chunk.append(entries[index][0])
+                index += 1
+            self.log_text.insert("end", "".join(line + "\n" for line in chunk), tag)
+        self._trim_log()
+        self._scroll_log_if_needed(at_bottom)
+
+    def _trim_log(self) -> None:
+        """把日志控件里的行数限制在 LOG_MAX_LINES 以内。"""
+        last = int(self.log_text.index("end-1c").split(".")[0])
+        excess = last - LOG_MAX_LINES
+        if excess > 0:
+            self.log_text.delete("1.0", "{0}.0".format(excess + 1))
 
     def _log(self, text: str, level: int = INFO) -> None:
         self._append_log(text, level)
@@ -304,20 +390,115 @@ class SubFontMKVApp(object):
             self._log("既没有 mkvmerge 也没有 ffmpeg，无法封装。请安装 MKVToolNix。", ERROR)
 
     # ------------------------------------------------------------------
-    # 添加 / 移除
+    # 拖拽与添加
     # ------------------------------------------------------------------
-    def _on_drag_enter(self, _event):
-        self.drop_hint.configure(bg="#dbeafe", fg="#1d4ed8")
+    def _drop_hint_text(self) -> str:
+        if HAS_DND:
+            return "可以把视频文件或文件夹拖到这里添加"
+        return "拖拽不可用（未安装 tkinterdnd2），请使用下方按钮添加"
+
+    def _refresh_drop_hint(self) -> None:
+        """列表为空时，用拖拽提示占住列表的位置；有文件后换成真正的列表。"""
+        if not hasattr(self, "drop_hint") or not self.drop_hint.winfo_exists():
+            return
+        if self.order:
+            self.drop_hint.grid_remove()
+            self.tree.grid()
+            for bar in getattr(self, "_drop_scrollbars", ()):
+                bar.grid()
+        else:
+            self.tree.grid_remove()
+            for bar in getattr(self, "_drop_scrollbars", ()):
+                bar.grid_remove()
+            self.drop_hint.grid()
+
+    def _on_hint_resize(self, event) -> None:
+        """让提示文字随容器宽度换行。
+
+        缩放窗口时 <Configure> 会连续触发很多次，每次都改 wraplength 会反过来
+        触发新的布局计算（越拖越卡），所以把宽度变化累积到 idle 时再应用一次。
+        """
+        self._pending_hint_width = max(int(event.width) - 24, 200)
+        if self._hint_resize_job is None:
+            self._hint_resize_job = self.root.after_idle(self._apply_hint_width)
+
+    def _apply_hint_width(self) -> None:
+        self._hint_resize_job = None
+        width = getattr(self, "_pending_hint_width", None)
+        if width is None or not self.drop_hint.winfo_exists():
+            return
+        try:
+            current = int(self.drop_hint.cget("wraplength") or 0)
+        except Exception:
+            return
+        if abs(current - width) > 8:
+            self.drop_hint.configure(wraplength=width)
+
+    def _enable_drop(self, widget, register: bool = True) -> None:
+        """让控件成为拖放目标。
+
+        register=False 时只绑定回调：这样提示标签上的拖拽事件会冒泡到父容器，
+        由父容器统一处理，避免「拖到提示文字上就没反应」。
+        """
+        if not HAS_DND:
+            return
+        try:
+            if register:
+                widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._on_drop)
+            widget.dnd_bind("<<DragEnter>>", self._on_drag_enter)
+            widget.dnd_bind("<<DragLeave>>", self._on_drag_leave)
+        except Exception:
+            pass
+
+    def _set_hover(self, active: bool) -> None:
+        """拖拽悬停高亮。
+
+        只在状态真正变化时才改样式 —— 拖动过程中 DragEnter 会连续触发，
+        每次都去 configure 会造成可见的卡顿。
+        """
+        if active == self._drag_hover:
+            return
+        self._drag_hover = active
+
+        # ttk 控件没有 background 选项，只能通过切换 style 改外观；
+        # 只高亮「添加视频」这一整块外框，比逐个子控件着色更便宜也更整洁。
+        try:
+            self._drop_box.configure(
+                style=self._hover_style("TLabelframe") if active else "TLabelframe")
+        except Exception:
+            pass
+        try:
+            self.drop_hint.configure(
+                background=DROP_HOVER_BG if active else self._hint_base_bg)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _hover_style(base: str) -> str:
+        return "DropHover." + base
+
+    @staticmethod
+    def prepare_hover_styles() -> None:
+        """注册拖拽悬停用的 ttk 样式（必须在创建控件前调用）。"""
+        style = ttk.Style()
+        style.configure("DropHover.TLabelframe", background=DROP_HOVER_BG)
+
+    def _on_drag_enter(self, _event=None):
+        self._set_hover(True)
         return "copy"
 
-    def _on_drag_leave(self, _event):
-        self.drop_hint.configure(bg="#fafafa", fg="#555555")
+    def _on_drag_leave(self, _event=None):
+        self._set_hover(False)
         return "copy"
 
     def _on_drop(self, event):
-        self.drop_hint.configure(bg="#fafafa", fg="#555555")
-        paths = self.root.tk.splitlist(event.data)
-        self.add_paths(list(paths))
+        self._set_hover(False)
+        try:
+            paths = list(self.root.tk.splitlist(event.data))
+        except Exception:
+            paths = [event.data]
+        self.add_paths(paths)
         return "copy"
 
     def _pick_files(self) -> None:
@@ -374,6 +555,7 @@ class SubFontMKVApp(object):
             if self._insert_video(video):
                 added += 1
         self._refresh_summary()
+        self._refresh_drop_hint()
         if added:
             self._log("已添加 {0} 个视频。".format(added), INFO)
         elif videos:
@@ -445,12 +627,14 @@ class SubFontMKVApp(object):
             if key in self.order:
                 self.order.remove(key)
         self._refresh_summary()
+        self._refresh_drop_hint()
 
     def _clear(self) -> None:
         self.tree.delete(*self.tree.get_children())
         self.entries.clear()
         self.order.clear()
         self._refresh_summary()
+        self._refresh_drop_hint()
 
     def _refresh_summary(self) -> None:
         total = len(self.order)

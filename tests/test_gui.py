@@ -70,12 +70,153 @@ assert app.status_var.get().startswith("完成: 成功 1"), app.status_var.get()
 assert seen and seen[-1][0] == "info", seen
 print("7 完成回调 OK")
 
+# ---- 拖拽区域：提示文字为蓝色高亮，且旧的拖拽占位框已移除 ----
+print("8 拖拽提示:", repr(app.drop_hint.cget("text")))
+assert app.drop_hint.cget("foreground") == gui.DROP_HINT_COLOR, app.drop_hint.cget("foreground")
+assert "拖" in app.drop_hint.cget("text") and "文件夹" in app.drop_hint.cget("text")
+assert not hasattr(app, "drop_hint_box"), "旧的拖拽区域控件应该已经删除"
+print("   颜色:", app.drop_hint.cget("foreground"), "字体:", app.drop_hint.cget("font"))
+
+# 悬停状态机：只在状态变化时改样式（拖拽过程重复 enter 不应反复 configure）
+assert app._drag_hover is False
+app._on_drag_enter(None)
+assert app._drag_hover is True and app._drop_box.cget("style") == "DropHover.TLabelframe"
+app._on_drag_leave(None)
+assert app._drag_hover is False and app._drop_box.cget("style") == "TLabelframe"
+
+calls = []
+orig_cfg = tk.Widget.configure
+def spy(self, cnf=None, **kw):
+    calls.append(kw)
+    return orig_cfg(self, cnf, **kw)
+tk.Widget.configure = spy
+import tkinter.ttk as _ttk
+_ttk.Widget.configure = spy
+try:
+    # 先让状态真正进入「悬停」，再观察后续重复 enter 的开销
+    app._on_drag_enter(None)
+    del calls[:]
+    for _ in range(300):
+        app._on_drag_enter(None)
+    assert calls == [], "已高亮时重复 DragEnter 不应做多余的 configure：%r" % calls[:3]
+finally:
+    tk.Widget.configure = orig_cfg
+    _ttk.Widget.configure = orig_cfg
+print("9 悬停高亮 OK（300 次重复 DragEnter 零重绘）")
+
+# 提示文字随宽度换行，窄窗口不会撑破布局。
+# 宽度更新被推迟到 idle（避免每帧都重排），这里要跑一次 update 让它生效。
+app._on_hint_resize(type("E", (), {"width": 300})())
+root.update()
+assert int(app.drop_hint.cget("wraplength")) <= 300, app.drop_hint.cget("wraplength")
+print("10 提示自动换行 OK, wraplength =", app.drop_hint.cget("wraplength"))
+
+# ---- 提示是「添加视频」区域内部的空状态占位，与列表互斥 ----
+def _hint_shown():
+    return app.drop_hint.grid_info() != {}
+
+def _tree_shown():
+    return app.tree.grid_info() != {}
+
+# 提示必须位于「1. 添加视频」这块 LabelFrame 内
+container = app.drop_hint.master
+chain_texts = []
+node = container
+while node is not None and node is not root:
+    try:
+        if node.winfo_class() == "TLabelframe":
+            chain_texts.append(str(node.cget("text")))
+    except Exception:
+        pass
+    node = getattr(node, "master", None)
+assert any("添加视频" in t for t in chain_texts), chain_texts
+print("11 提示位于「添加视频」区域内 OK, 容器标题:", chain_texts)
+
+app._clear(); root.update()
+assert _hint_shown() and not _tree_shown(), (_hint_shown(), _tree_shown())
+app.add_paths([os.path.join(ROOT, "test-assets", "Show EP01.mkv")]); root.update()
+assert not _hint_shown() and _tree_shown(), (_hint_shown(), _tree_shown())
+app._clear(); root.update()
+assert _hint_shown() and not _tree_shown(), (_hint_shown(), _tree_shown())
+print("12 提示/列表互斥 OK（空列表显示提示 -> 有文件换成列表 -> 清空恢复）")
+
+# ---- 模拟一次真实拖放：Tk 对含空格的路径会用花括号包裹 ----
+drop_dir = tempfile.mkdtemp(prefix="drop-")
+drop_videos = []
+for i in range(3):
+    p = os.path.join(drop_dir, "My Video %d.mkv" % i)
+    with open(p, "wb") as fp:
+        fp.write(b"x")
+    with open(os.path.join(drop_dir, "My Video %d.chs.ass" % i), "w", encoding="utf-8"):
+        pass
+    drop_videos.append(p)
+
+class _FakeDrop:
+    data = " ".join("{%s}" % v for v in drop_videos)
+
+app._clear()
+app._on_drag_enter(None)
+assert app._drag_hover is True
+app._on_drop(_FakeDrop())
+assert len(app.order) == 3, app.order
+assert app._drag_hover is False, "放下后应恢复高亮"
+assert all(app.entries[k]["tag"] == "ok" for k in app.order)
+print("13 模拟拖放 OK（含空格路径的花括号列表格式）")
+
+# ---- 批量拖入性能：不再为每个视频重复扫描目录 ----
+bulk = tempfile.mkdtemp(prefix="bulk-")
+BULK_N = 200
+for i in range(BULK_N):
+    with open(os.path.join(bulk, "EP%03d.mkv" % i), "wb") as fp:
+        fp.write(b"x")
+    with open(os.path.join(bulk, "EP%03d.chs.ass" % i), "w", encoding="utf-8"):
+        pass
+app._clear()
+t0 = time.perf_counter()
+app.add_paths([bulk])
+bulk_dt = time.perf_counter() - t0
+print("14 拖入 %d 个视频耗时 %.3fs（%.0f 个/秒）" % (BULK_N, bulk_dt, BULK_N / bulk_dt))
+assert len(app.order) == BULK_N
+assert bulk_dt < 3.0, "批量添加太慢: %.3fs" % bulk_dt
+shutil.rmtree(bulk, ignore_errors=True)
+
+
+
+# ---- 日志：行数受限、自动滚动只在贴底时生效 ----
+app._clear_log()
+for i in range(gui.LOG_MAX_LINES * 3):
+    app._append_log("log line %d" % i, 20)
+root.update()
+kept_lines = int(app.log_text.index("end-1c").split(".")[0])
+assert kept_lines <= gui.LOG_MAX_LINES + 1, kept_lines
+print("15 日志行数上限 OK（写入 %d 行，控件保留 %d 行）"
+      % (gui.LOG_MAX_LINES * 3, kept_lines))
+
+assert app._log_at_bottom() is True, "刚写完应贴底"
+app.log_text.yview_moveto(0.0)
+root.update()
+assert app._log_at_bottom() is False
+app._append_log("追加一行", 20)
+root.update()
+assert app.log_text.yview()[0] < 0.5, "用户上翻后不应被强行拉到底部"
+print("16 日志滚动 OK（贴底才跟随，上翻不打扰）")
+
+# ---- 批量日志插入远快于逐行（防卡顿的核心）----
+app._clear_log()
+entries = [("bulk line %d" % i, 20) for i in range(2000)]
+t0 = time.perf_counter()
+app._append_log_batch(entries)
+batch_dt = time.perf_counter() - t0
+print("17 批量写入 2000 行日志: %.3fs" % batch_dt)
+assert batch_dt < 0.5, "批量写入过慢: %.3fs" % batch_dt
+
 # 界面确实能渲染（不弹窗，只做一次布局计算）
 root2 = tk.Tk(); root2.withdraw()
 app2 = gui.SubFontMKVApp(root2)
 root2.update_idletasks()
-print("8 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
+print("18 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
 root2.destroy()
+shutil.rmtree(drop_dir, ignore_errors=True)
 root.destroy()
 shutil.rmtree(work, ignore_errors=True); shutil.rmtree(empty, ignore_errors=True)
 print("\nGUI CHECKS PASSED")

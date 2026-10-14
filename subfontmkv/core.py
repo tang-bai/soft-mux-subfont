@@ -19,9 +19,6 @@ from .mux import MuxError, Muxer, is_subtitle, is_video, select_muxer
 
 log = get_logger("core")
 
-#: 与视频同名的字幕才算外挂字幕；这些后缀允许出现在名字与扩展名之间
-RE_SUBTITLE_SUFFIX = re.compile(r"^(?:[.\-_ ]|$)")
-
 
 class SubtitleMatch(object):
     """一个视频匹配到的一条字幕。"""
@@ -111,42 +108,94 @@ class Options(object):
 # --------------------------------------------------------------------------
 # 字幕匹配
 # --------------------------------------------------------------------------
+#: 目录字幕清单缓存：{目录 : (签名, [(小写文件名, 绝对路径)])}
+#: GUI 里把一整个文件夹拖进来时，会连续为几十上百个视频做匹配；
+#: 每个视频都重新 scandir 同一个目录会明显卡顿，这里按目录缓存一次。
+_subtitle_cache: Dict[str, tuple] = {}
+#: 缓存上限，超过就直接清空（避免长时间开着程序而无限增长）
+_SUBTITLE_CACHE_LIMIT = 512
+
+
+def clear_subtitle_cache() -> None:
+    """清空字幕清单缓存（目录内容变化后调用）。"""
+    _subtitle_cache.clear()
+
+
+def _directory_signature(directory: str):
+    """给目录取一个廉价的「内容签名」，用于判断缓存是否还有效。"""
+    try:
+        stat = os.stat(directory)
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
+
+
+def _subtitle_entries(directory: str) -> List[tuple]:
+    """列出目录里的字幕文件，带缓存。
+
+    每一项预先算好，供匹配热路径直接使用（避免每个「视频 × 字幕」组合都做
+    一次 basename/splitext/normcase，那会让批量匹配变成 O(视频数 × 字幕数) 次路径运算）：
+
+        (小写文件名主干, 绝对路径, 小写绝对路径, 推断出的语言)
+    """
+    signature = _directory_signature(directory)
+    cached = _subtitle_cache.get(directory)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    entries: List[tuple] = []
+    try:
+        scanned = sorted(os.scandir(directory), key=lambda e: e.name.lower())
+    except OSError:
+        scanned = []
+    for entry in scanned:
+        try:
+            if not entry.is_file(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        name = entry.name
+        if not is_subtitle(name):
+            continue
+        path = os.path.abspath(entry.path)
+        stem = os.path.splitext(name)[0]
+        entries.append((stem.lower(), path, path.lower(),
+                        ass.language_from_name(name)))
+
+    if signature is not None:
+        if len(_subtitle_cache) >= _SUBTITLE_CACHE_LIMIT:
+            clear_subtitle_cache()
+        _subtitle_cache[directory] = (signature, entries)
+    return entries
+
+
 def find_subtitles(video: str, extra_dirs: Sequence[str] = (), ) -> List[str]:
     """找出与视频同名的外挂字幕。
 
     同时搜索视频所在目录与 --sub-dir 指定的目录，结果按绝对路径去重，
     避免同一个字幕被匹配到两次而封装出重复轨道。
+    目录清单带缓存，批量匹配同一目录下的视频时不会反复扫描磁盘。
     """
-    stem = os.path.splitext(os.path.basename(video))[0]
+    stem = os.path.splitext(os.path.basename(video))[0].lower()
     directories: List[str] = [os.path.dirname(os.path.abspath(video))]
     for d in extra_dirs:
         real = os.path.abspath(d)
         if os.path.isdir(real):
             directories.append(real)
     seen: Set[str] = set()
-    matches: List[str] = []
+    found: List[tuple] = []
     for directory in directories:
-        try:
-            entries = sorted(os.scandir(directory), key=lambda e: e.name.lower())
-        except OSError:
-            continue
-        for entry in entries:
-            if not entry.is_file(follow_symlinks=False):
+        for entry in _subtitle_entries(directory):
+            lower_stem, path, lower_path, language = entry
+            if lower_path in seen:
                 continue
-            path = os.path.abspath(entry.path)
-            key = os.path.normcase(path)
-            if key in seen:
+            if not _stem_matches(stem, lower_stem):
                 continue
-            name = entry.name
-            if not is_subtitle(path):
-                continue
-            if not _name_matches(stem, name):
-                continue
-            seen.add(key)
-            matches.append(path)
+            seen.add(lower_path)
+            found.append((language or "zzz", lower_stem, path))
     # 按 (语言, 文件名) 排序，保证语言与轨道顺序稳定可预期
-    matches.sort(key=lambda p: (ass.language_from_name(p) or "zzz", os.path.basename(p).lower()))
-    return matches
+    found.sort()
+    return [path for _lang, _stem, path in found]
 
 
 #: 允许出现在视频名之后、属于同一部片子的版本标记（v2 / ver2 / version2）。
@@ -154,34 +203,37 @@ def find_subtitles(video: str, extra_dirs: Sequence[str] = (), ) -> List[str]:
 RE_VERSION_TOKEN = re.compile(r"^(?:v|ver|version)\d+$", re.IGNORECASE)
 
 
-def _name_matches(stem: str, subtitle_name: str) -> bool:
-    """判断字幕文件名是否属于该视频（视频名 + 语言/版本标记 + 扩展名）。
+#: 匹配时允许忽略的额外标记（本工具自己的产物后缀等）
+_IGNORED_MARKERS = frozenset(("subset", "font", "fonts", "zh", "cn"))
 
-    只允许在视频名之后追加语言标签（chs/jpn/...）与版本标记（v2/ep01/...），
+
+def _stem_matches(stem: str, name: str) -> bool:
+    """判断字幕文件名主干是否属于该视频（两个参数都必须已是小写）。
+
+    只允许在视频名之后追加语言标签（chs/jpn/...）与版本标记（v2/ver2/...），
     这样可以避免同一目录下 "Show.mkv" 误吃 "Show EP01.chs.ass"。
     """
-    name = os.path.splitext(subtitle_name)[0]
-    if name.lower() == stem.lower():
+    if name == stem:
         return True
-    if not name.lower().startswith(stem.lower()):
+    if not name.startswith(stem):
         return False
     rest = name[len(stem):]
     if not rest:
         return True
     if rest[0] not in ".-_ ":
         return False
-    if not RE_SUBTITLE_SUFFIX.match(rest):
-        return False
-    for token in (t for t in re.split(r"[.\-_ ]+", rest) if t):
-        low = token.lower()
-        if low in ass.LANGUAGE_TAGS:
+    for token in rest.replace(".", " ").replace("-", " ").replace("_", " ").split():
+        if token in ass.LANGUAGE_TAGS or token in _IGNORED_MARKERS:
             continue
-        if RE_VERSION_TOKEN.match(low):
-            continue
-        if low in ("subset", "font", "fonts", "zh", "cn"):
+        if RE_VERSION_TOKEN.match(token):
             continue
         return False
     return True
+
+
+def _name_matches(stem: str, subtitle_name: str) -> bool:
+    """判断字幕文件名是否属于该视频（按文件名判断的便捷入口）。"""
+    return _stem_matches(stem.lower(), os.path.splitext(subtitle_name)[0].lower())
 
 
 def match_subtitles(video: str, options: Options) -> List[SubtitleMatch]:

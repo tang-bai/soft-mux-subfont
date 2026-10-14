@@ -507,8 +507,26 @@ LANGUAGE_TAGS: Dict[str, str] = {
 }
 
 
+#: language_from_name 的结果缓存：批量匹配时同一个文件名会被反复问
+_MISSING = object()
+_language_cache: Dict[str, Optional[str]] = {}
+_LANGUAGE_CACHE_LIMIT = 4096
+
+
 def language_from_name(filename: str) -> Optional[str]:
     """从文件名推断字幕语言，返回 ISO-639-2 三字母代码。"""
+    base = os.path.basename(filename)
+    cached = _language_cache.get(base, _MISSING)
+    if cached is not _MISSING:
+        return cached  # type: ignore[return-value]
+    result = _language_from_name_uncached(base)
+    if len(_language_cache) >= _LANGUAGE_CACHE_LIMIT:
+        _language_cache.clear()
+    _language_cache[base] = result
+    return result
+
+
+def _language_from_name_uncached(filename: str) -> Optional[str]:
     stem = os.path.splitext(os.path.basename(filename))[0]
     parts = [p for p in re.split(r"[.\-_\[\]()\s]+", stem) if p]
     for part in reversed(parts):
