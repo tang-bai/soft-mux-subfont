@@ -251,11 +251,80 @@ app._finish_progress()
 assert app.progress["value"] == app.progress["maximum"]
 print("22 完成后进度条填满 OK")
 
+# ---- 日志筛选：按级别 + 关键字 ----
+from subfontmkv.log import DEBUG as _DEBUG, INFO as _INFO, WARNING as _WARN, ERROR as _ERR
+
+def _visible_lines():
+    """只统计没被 HIDDEN（elide）标签盖住的行。"""
+    out = []
+    end = int(app.log_text.index("end-1c").split(".")[0])
+    for i in range(1, end):
+        if "HIDDEN" not in app.log_text.tag_names("%d.0" % i):
+            line = app.log_text.get("%d.0" % i, "%d.end" % i)
+            if line:
+                out.append(line)
+    return out
+
+app._clear_log()
+app._append_log("调试 A", _DEBUG)
+app._append_log("调试 B", _DEBUG)
+app._append_log("普通信息", _INFO)
+app._append_log("一条警告", _WARN)
+app._append_log("一条错误", _ERR)
+root.update()
+assert len(_visible_lines()) == 5, _visible_lines()
+
+app.log_level_var.set("信息"); app._render_log(); root.update()
+assert len(_visible_lines()) == 3, _visible_lines()
+assert app.log_count_var.get() == "显示 3 / 5 行", app.log_count_var.get()
+print("24 级别筛选 OK（5 条日志中 2 条 DEBUG -> 选「信息」后可见 3 条，%r）"
+      % app.log_count_var.get())
+
+app.log_level_var.set("警告以上"); app._render_log(); root.update()
+assert sorted(_visible_lines()) == sorted(["一条警告", "一条错误"]), _visible_lines()
+app.log_level_var.set("仅错误"); app._render_log(); root.update()
+assert _visible_lines() == ["一条错误"], _visible_lines()
+print("25 警告以上/仅错误 筛选 OK")
+
+# 关键字与级别可以叠加，且大小写不敏感
+app.log_level_var.set("全部（含调试）")
+app.log_search_var.set("调试"); app._render_log(); root.update()
+assert sorted(_visible_lines()) == ["调试 A", "调试 B"], _visible_lines()
+app.log_search_var.set("一条"); app._render_log(); root.update()
+assert sorted(_visible_lines()) == ["一条警告", "一条错误"], _visible_lines()
+
+# 新日志按当前筛选条件插入
+app.log_level_var.set("仅错误"); app._render_log()
+app._append_log("新的一条错误", _ERR)
+app._append_log("新的一条信息", _INFO)
+root.update()
+vis = _visible_lines()
+assert "新的一条错误" in vis and "新的一条信息" not in vis, vis
+print("26 关键字过滤 + 新日志按筛选插入 OK")
+
+# 复制只包含可见行
+app._copy_log()
+copied = root.clipboard_get()
+assert "新的一条错误" in copied and "新的一条信息" not in copied, copied
+print("27 复制只含可见行 OK")
+
+# 重置后恢复全部，且行数上限仍生效
+app._reset_log_filter(); root.update()
+# 5 条初始 + 2 条追加 + 1 条「已复制…」提示
+assert app.log_search_var.get() == "", app.log_search_var.get()
+assert len(_visible_lines()) == 8, _visible_lines()
+app._clear_log()
+for i in range(gui.LOG_MAX_LINES * 3):
+    app._append_log("行 %d" % i, _INFO)
+root.update()
+assert len(app.log_buffer) == gui.LOG_MAX_LINES, len(app.log_buffer)
+print("28 重置筛选 / 行数上限 OK（缓冲区 %d 条）" % len(app.log_buffer))
+
 # 界面确实能渲染（不弹窗，只做一次布局计算）
 root2 = tk.Tk(); root2.withdraw()
 app2 = gui.SubFontMKVApp(root2)
 root2.update_idletasks()
-print("23 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
+print("29 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
 root2.destroy()
 shutil.rmtree(drop_dir, ignore_errors=True)
 root.destroy()

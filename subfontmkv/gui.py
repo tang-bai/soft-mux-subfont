@@ -50,6 +50,15 @@ LOG_QUEUE_LIMIT = 4000
 #: 一次批量插入多少行日志，减少 Text 控件的重排次数
 LOG_BATCH_SIZE = 256
 
+#: 日志筛选下拉项：(显示名, 最低级别)
+#: 选择某一项时，只显示「不低于」该级别的日志。
+LOG_FILTERS = [
+    ("全部（含调试）", DEBUG),
+    ("信息", INFO),
+    ("警告以上", WARNING),
+    ("仅错误", ERROR),
+]
+
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
 
@@ -92,6 +101,8 @@ class SubFontMKVApp(object):
         self.log_queue: "queue.Queue[Tuple[str, int]]" = queue.Queue()
         self.ui_queue: "queue.Queue[tuple]" = queue.Queue()
         self._log_dropped = 0
+        #: 内存里的日志记录 [(文本, 级别)]，切换筛选时用它重绘
+        self.log_buffer: List[tuple] = []
         self._hint_resize_job = None
         self._pending_hint_width = None
 
@@ -260,6 +271,28 @@ class SubFontMKVApp(object):
     def _build_right(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="日志", padding=6)
         box.pack(fill="both", expand=True)
+        # -- 筛选栏：按级别筛选 + 关键字过滤 --
+        filters = ttk.Frame(box)
+        filters.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Label(filters, text="显示").pack(side="left")
+        self.log_level_var = tk.StringVar(value=LOG_FILTERS[0][0])
+        self.log_level_box = ttk.Combobox(
+            filters, textvariable=self.log_level_var, state="readonly", width=12,
+            values=[name for name, _level in LOG_FILTERS])
+        self.log_level_box.pack(side="left", padx=(4, 8))
+        self.log_level_box.bind("<<ComboboxSelected>>", lambda _e: self._render_log())
+
+        ttk.Label(filters, text="包含").pack(side="left")
+        self.log_search_var = tk.StringVar()
+        search = ttk.Entry(filters, textvariable=self.log_search_var, width=16)
+        search.pack(side="left", padx=(4, 4))
+        search.bind("<KeyRelease>", lambda _e: self._render_log())
+        search.bind("<Return>", lambda _e: self._render_log())
+        ttk.Button(filters, text="✕", width=3,
+                   command=self._reset_log_filter).pack(side="left")
+        self.log_count_var = tk.StringVar(value="")
+        ttk.Label(filters, textvariable=self.log_count_var).pack(side="left", padx=(8, 0))
+
         # wrap="word"：超长的一行（mkvmerge 命令行、带完整路径的日志）会自动换行，
         # 不再需要横向滚动；单词之间优先断行，遇到没有空格的超长路径（如中文目录）
         # Tk 会自动退化成按字符断行，不会横向溢出。
@@ -268,18 +301,21 @@ class SubFontMKVApp(object):
                                 font=("Consolas", 9))
         yscroll = ttk.Scrollbar(box, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=yscroll.set)
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        box.rowconfigure(0, weight=1)
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+        yscroll.grid(row=1, column=1, sticky="ns")
+        box.rowconfigure(1, weight=1)
         box.columnconfigure(0, weight=1)
         for tag, color in (("INFO", "#e0e0e0"), ("WARNING", "#ffcc66"),
-                           ("ERROR", "#ff6b6b"), ("DEBUG", "#8a8a8a")):
+                           ("ERROR", "#ff6b6b"), ("DEBUG", "#8a8a8a"),
+                           ("HIDDEN", "")):
             self.log_text.tag_configure(tag, foreground=color)
+        self.log_text.tag_configure("HIDDEN", elide=True)
 
         buttons = ttk.Frame(box)
-        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(buttons, text="复制全部", command=self._copy_log).pack(side="left")
         ttk.Button(buttons, text="清空日志", command=self._clear_log).pack(side="left", padx=4)
+        ttk.Button(buttons, text="滚到底部", command=self._scroll_log_to_end).pack(side="left", padx=4)
 
     # ------------------------------------------------------------------
     # 日志
@@ -341,49 +377,138 @@ class SubFontMKVApp(object):
         if was_at_bottom:
             self.log_text.see("end")
 
+    # -- 筛选 ---------------------------------------------------------------
+    def _log_min_level(self) -> int:
+        """当前筛选的最低级别。"""
+        name = self.log_level_var.get()
+        for label, level in LOG_FILTERS:
+            if label == name:
+                return level
+        return DEBUG
+
+    def _log_search(self) -> str:
+        return (self.log_search_var.get() or "").strip().lower()
+
+    def _log_visible(self, text: str, level: int) -> bool:
+        """判断一条日志在当前筛选条件下是否应当显示。"""
+        if level < self._log_min_level():
+            return False
+        keyword = self._log_search()
+        if keyword and keyword not in (text or "").lower():
+            return False
+        return True
+
+    def _reset_log_filter(self) -> None:
+        self.log_level_var.set(LOG_FILTERS[0][0])
+        self.log_search_var.set("")
+        self._render_log()
+
+    def _render_log(self) -> None:
+        """按当前筛选条件重绘整个日志区。
+
+        缓冲区最多 LOG_MAX_LINES 条，与 Text 控件里的行数严格一致；
+        被筛掉的行打上 HIDDEN（elide）标签，所以切换筛选只是改标签、很快。
+        """
+        min_level = self._log_min_level()
+        keyword = self._log_search()
+        self.log_text.delete("1.0", "end")
+        for text, level in self.log_buffer:
+            visible = level >= min_level and (not keyword or keyword in (text or "").lower())
+            self.log_text.insert("end", (text or "") + "\n",
+                                 self._log_tag(level) if visible else "HIDDEN")
+        self._scroll_log_if_needed(True)
+        self._update_log_count()
+
+    def _scroll_log_to_end(self) -> None:
+        self.log_text.see("end")
+
+    # -- 写入 ---------------------------------------------------------------
     def _append_log(self, text: str, level: int) -> None:
-        at_bottom = self._log_at_bottom()
-        self.log_text.insert("end", text + "\n", self._log_tag(level))
-        self._trim_log()
-        self._scroll_log_if_needed(at_bottom)
+        self._append_log_batch([(text, level)])
 
     def _append_log_batch(self, entries: List[tuple]) -> None:
-        """一次插入多行。
+        """把若干条日志追加到日志区。
 
-        Text.insert 每调用一次都会触发布局重算，逐行插入大量日志时会明显卡顿
-        （尤其是后台线程刷日志的时候），所以按批次插入。
+        缓冲区与 Text 控件保持严格一致（都最多 LOG_MAX_LINES 行）：
+        新行按当前筛选条件决定用级别标签还是 HIDDEN 标签插入，
+        超出上限的旧行同时从缓冲区和控件顶部删掉。
+
+        Text.insert 每次都会触发布局重算，所以连续同样可见性的行合并成一次插入。
         """
-        # 连续同级别的行合并成一次 insert
+        if not entries:
+            return
         at_bottom = self._log_at_bottom()
+        min_level = self._log_min_level()
+        keyword = self._log_search()
+
+        self.log_buffer.extend(entries)
+        dropped = len(self.log_buffer) - LOG_MAX_LINES
+        if dropped > 0:
+            del self.log_buffer[:dropped]
+
         index = 0
         total = len(entries)
         while index < total:
-            level = entries[index][1]
-            tag = self._log_tag(level)
+            text, level = entries[index]
+            visible = level >= min_level and (not keyword or keyword in (text or "").lower())
+            tag = self._log_tag(level) if visible else "HIDDEN"
             chunk = []
-            while index < total and entries[index][1] == level and len(chunk) < LOG_BATCH_SIZE:
-                chunk.append(entries[index][0])
+            while index < total and len(chunk) < LOG_BATCH_SIZE:
+                ntext, nlevel = entries[index]
+                nvisible = (nlevel >= min_level
+                            and (not keyword or keyword in (ntext or "").lower()))
+                if nvisible != visible:
+                    break
+                chunk.append(ntext)
                 index += 1
             self.log_text.insert("end", "".join(line + "\n" for line in chunk), tag)
-        self._trim_log()
-        self._scroll_log_if_needed(at_bottom)
 
-    def _trim_log(self) -> None:
-        """把日志控件里的行数限制在 LOG_MAX_LINES 以内。"""
-        last = int(self.log_text.index("end-1c").split(".")[0])
-        excess = last - LOG_MAX_LINES
-        if excess > 0:
-            self.log_text.delete("1.0", "{0}.0".format(excess + 1))
+        if dropped > 0:
+            self.log_text.delete("1.0", "{0}.0".format(dropped + 1))
+        self._scroll_log_if_needed(at_bottom)
+        self._update_log_count()
+
+    def _update_log_count(self) -> None:
+        total = len(self.log_buffer)
+        if total == 0:
+            self.log_count_var.set("")
+            return
+        min_level = self._log_min_level()
+        keyword = self._log_search()
+        shown = sum(1 for text, level in self.log_buffer
+                    if level >= min_level and (not keyword or keyword in (text or "").lower()))
+        if shown == total:
+            self.log_count_var.set("%d 行" % total)
+        else:
+            self.log_count_var.set("显示 %d / %d 行" % (shown, total))
 
     def _log(self, text: str, level: int = INFO) -> None:
         self._append_log(text, level)
 
     def _clear_log(self) -> None:
         self.log_text.delete("1.0", "end")
+        self.log_buffer.clear()
+        self._update_log_count()
 
     def _copy_log(self) -> None:
+        """复制日志。
+
+        有筛选时只复制当前可见的行 —— 否则「筛选出错误再复制」会连带把
+        被筛掉的调试信息也一起复制走，与看到的对不上。
+        """
+        min_level = self._log_min_level()
+        keyword = self._log_search()
+        if min_level <= DEBUG and not keyword:
+            text = self.log_text.get("1.0", "end")
+        else:
+            text = "".join(
+                (line or "") + "\n" for line, level in self.log_buffer
+                if level >= min_level and (not keyword or keyword in (line or "").lower()))
         self.root.clipboard_clear()
-        self.root.clipboard_append(self.log_text.get("1.0", "end"))
+        self.root.clipboard_append(text)
+        self._log("已复制 %d 个字符到剪贴板。%s"
+                  % (len(text), "（仅当前筛选结果）" if (min_level > DEBUG or keyword) else ""),
+                  INFO)
 
     def _log_tools(self) -> None:
         mkv = find_mkvmerge()
