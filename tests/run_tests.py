@@ -286,6 +286,127 @@ class TestFonts(unittest.TestCase):
 
 
 # ==========================================================================
+# 损坏字体表的容错（真实案例：Reishoreiryu 的 gasp 表 -> "too much data"）
+# ==========================================================================
+def _corrupt_optional_table(src, dst, tag="gasp"):
+    """把字体里的某个可选表改成「尾部多出数据」，复现 fontTools 的展开断言。
+
+    返回 True 表示成功注入。
+    """
+    import struct
+
+    from fontTools.ttLib import TTFont
+
+    base = dst + ".base"
+    font = TTFont(src, lazy=False)
+    if tag == "gasp":
+        from fontTools.ttLib.tables._g_a_s_p import table__g_a_s_p
+
+        table = table__g_a_s_p()
+        table.version = 1
+        table.gaspRange = {8: 2, 65535: 3}
+        font["gasp"] = table
+    font.save(base)
+    font.close()
+
+    data = open(base, "rb").read()
+    count = struct.unpack(">H", data[4:6])[0]
+    entry = None
+    for i in range(count):
+        off = 12 + i * 16
+        if data[off:off + 4].decode("latin-1") == tag:
+            _cs, offset, length = struct.unpack(">III", data[off + 4:off + 16])
+            entry = (off, offset, length)
+            break
+    if entry is None:
+        os.remove(base)
+        return False
+
+    dir_off, offset, length = entry
+    buf = bytearray(data)
+    buf[offset + length:offset + length] = struct.pack(">HH", 12, 2)
+    struct.pack_into(">I", buf, dir_off + 12, length + 4)
+    open(dst, "wb").write(bytes(buf))
+    os.remove(base)
+    return True
+
+
+@unittest.skipUnless(HAS_ASSETS, ASSETS_HINT)
+class TestBrokenFontTables(unittest.TestCase):
+    """某些字体的可选表写坏了，不该导致整个字体子集化失败。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.work = tempfile.mkdtemp(prefix="subfontmkv-broken-")
+        cls.src = os.path.join(TEST_FONTS, "SubFontTestSans-Regular.ttf")
+        cls.broken = os.path.join(cls.work, "Broken.ttf")
+        cls.injected = _corrupt_optional_table(cls.src, cls.broken, "gasp")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.work, ignore_errors=True)
+
+    def setUp(self):
+        if not self.injected:
+            self.skipTest("无法构造损坏的 gasp 表")
+
+    def test_broken_table_really_fails_without_fix(self):
+        """先确认这个字体确实有问题（否则测试就没意义）。"""
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(self.broken, lazy=False)
+        with self.assertRaises(AssertionError):
+            font["gasp"]          # 展开时才炸，这正是报错发生在子集化阶段的原因
+        font.close()
+
+    def test_detects_broken_table(self):
+        from fontTools.ttLib import TTFont
+
+        font = TTFont(self.broken, lazy=False)
+        try:
+            self.assertEqual(fonts._broken_optional_tables(font), ["gasp"])
+        finally:
+            font.close()
+
+    def test_load_font_safely_drops_broken_table(self):
+        font, dropped = fonts.load_font_safely(self.broken, 0)
+        try:
+            self.assertEqual(dropped, ["gasp"], dropped)
+            # 关键表必须还在
+            for tag in ("glyf", "cmap", "head", "hmtx", "name"):
+                self.assertIn(tag, font)
+            self.assertNotIn("gasp", font)
+        finally:
+            font.close()
+
+    def test_subset_succeeds_on_broken_font(self):
+        """核心回归：以前会报「子集化失败: too much data」。"""
+        out, crc = fonts.subset_font(self.broken, 0,
+                                     os.path.join(self.work, "fixed.ttf"), "ABC")
+        self.assertTrue(os.path.exists(out))
+
+        from fontTools.ttLib import TTFont
+
+        subset = TTFont(out, lazy=False)
+        try:
+            glyphs = [g for g in subset.getGlyphOrder() if g != ".notdef"]
+            self.assertTrue(glyphs, "子集后应保留字形")
+            self.assertNotIn("gasp", subset, "损坏的表不应出现在产物里")
+            families = [r.toUnicode() for r in subset["name"].names if r.nameID == 1]
+            self.assertTrue(families and families[0].endswith(crc), (families, crc))
+        finally:
+            subset.close()
+
+    def test_healthy_font_keeps_all_tables(self):
+        """正常字体不应被误伤（一个表都不该丢）。"""
+        font, dropped = fonts.load_font_safely(self.src, 0)
+        try:
+            self.assertEqual(dropped, [])
+        finally:
+            font.close()
+
+
+# ==========================================================================
 # 端到端封装
 # ==========================================================================
 @unittest.skipIf(MKVMERGE is None, "未安装 mkvmerge")

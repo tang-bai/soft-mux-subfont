@@ -80,6 +80,13 @@ Windows 装完在 `C:\Program Files\MKVToolNix\mkvmerge.exe`，程序会**自动
 
 ### 4. 开始使用
 
+**方式 A：便携版 exe（免装 Python，最省事）**
+
+下载 `SubFontMKV-*-portable-win64.zip`，解压后双击 **`SubFontMKV.exe`** 即可，
+不用装 Python。除了 MKVToolNix，没有别的依赖。
+
+**方式 B：直接用源码**
+
 把项目文件夹放着就行，**不需要安装**。直接：
 
 ```bash
@@ -314,6 +321,21 @@ Show EP01.mkv  ✅ Show EP01.ass        ✅ Show EP01.chs.ass     ✅ Show EP01.
 **找不到字体？**
 日志里会列出缺哪些。用 `--font-dir` 指定字体所在目录，或者把字体文件放到视频同目录。
 
+**提示「子集化失败: too much data」？**
+这是字体文件本身的毛病，不是你的操作问题。有些字体（尤其日文商用字体，
+如 Reishoreiryu）的 `gasp` 表头部声明的区间数少于实际数据，fontTools 展开到结尾
+发现有剩余字节就报错，导致整个字体用不了。
+
+程序会自动处理：**丢掉这一个表继续子集化**，日志里会提示
+「表 gasp 结构异常，已丢弃后继续子集化」。`gasp` 只影响「什么字号下启用网格适配」
+这类渲染提示，与字形、字符映射、样式名称都无关，丢掉不影响字幕显示。
+
+如果丢掉后仍然失败，可以改用 `--no-subset` 直接内嵌完整字体：
+
+```bash
+python -m subfontmkv "视频.mkv" --no-subset
+```
+
 **想保留原有的字幕轨？**
 加 `--keep-source-subs`。默认是丢弃的，因为多数情况下你要的是新做的这条。
 
@@ -337,6 +359,34 @@ python tests/test_gui.py                # 28 项 GUI 测试（需要图形环境
 端到端测试会**真的调用 mkvmerge 封装**，然后解封装回来校验：字幕轨语言是不是合法
 ISO-639-2、附件名有没有带 CRC32、以及**内嵌字幕引用的字体名是否与附件字体的内部名称完全一致**。
 没装 mkvmerge 时这部分自动跳过。
+
+### 打包便携版 exe
+
+想做一个免装 Python 的 Windows 便携版：
+
+```bash
+pip install pyinstaller
+python tools/build_exe.py --clean
+```
+
+产物：
+
+| 文件 | 说明 |
+| --- | --- |
+| `dist/SubFontMKV.exe` | 单文件，约 28 MB，双击即用 |
+| `release/SubFontMKV-1.0.0-portable-win64.zip` | 发布包：exe + 图标 + 使用说明 |
+
+打包时会自动：
+
+- 生成图标（`tools/make_icon.py`，也可以单独跑）；
+- 只把**当前平台**的 `tkdnd` 原生库塞进去（拖拽功能依赖它），其它平台的目录不带，省体积；
+- 收集 `fontTools` 的全部子模块（子集化会按需 import 各类字体表，漏掉就会在运行时炸）。
+
+调试打包问题时加 `--console` 保留控制台窗口：
+
+```bash
+python tools/build_exe.py --console
+```
 
 ### 与基础项目的关系
 
