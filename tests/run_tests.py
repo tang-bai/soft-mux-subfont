@@ -444,6 +444,71 @@ class TestEndToEnd(unittest.TestCase):
 
 
 # ==========================================================================
+# 进度解析与实时输出
+# ==========================================================================
+class TestProgress(unittest.TestCase):
+    def test_parse_both_formats(self):
+        from subfontmkv.mux import parse_progress
+
+        self.assertEqual(parse_progress("Progress: 42%"), 42)
+        self.assertEqual(parse_progress("#GUI#progress 7%"), 7)
+        self.assertEqual(parse_progress("Progress: 100%"), 100)
+        self.assertEqual(parse_progress("Progress: 0%"), 0)
+
+    def test_non_progress_lines(self):
+        from subfontmkv.mux import parse_progress
+
+        for line in ("mkvmerge v26.0.0 ('In The Game') 64-bit", "",
+                     "'file.mkv': Using the demultiplexer", "Multiplexing took 0 seconds."):
+            self.assertIsNone(parse_progress(line), line)
+
+    def test_progress_is_clamped(self):
+        from subfontmkv.mux import parse_progress
+
+        self.assertEqual(parse_progress("Progress: 250%"), 100)
+        self.assertEqual(parse_progress("Progress: -5%"), 0)
+
+    @unittest.skipIf(MKVMERGE is None, "未安装 mkvmerge")
+    @unittest.skipUnless(HAS_ASSETS, ASSETS_HINT)
+    def test_muxer_reports_progress(self):
+        """on_progress 必须在进程结束前被调用，而不是最后一次性给出。"""
+        import time
+
+        from subfontmkv.mux import MkvmergeMuxer
+
+        muxer = MkvmergeMuxer(MKVMERGE)
+        video = os.path.join(ASSETS, "Show EP01.mkv")
+        sub = os.path.join(ASSETS, "Show EP01.chs.ass")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.mkv")
+            events = []
+            t0 = time.time()
+            muxer.mux(video=video, output=out,
+                      subtitles=[(sub, "chi", "chs")], attachments=(),
+                      on_progress=lambda pct, line: events.append((time.time() - t0, pct)))
+            elapsed = time.time() - t0
+            self.assertTrue(os.path.exists(out), "应生成输出")
+            self.assertTrue(events, "应至少上报一次进度")
+
+            percents = [p for _t, p in events]
+            self.assertEqual(max(percents), 100, percents)
+            self.assertEqual(percents, sorted(percents), "进度必须单调不减: %r" % percents)
+            # 关键：第一条进度必须早于进程结束时刻
+            self.assertLess(events[0][0], elapsed,
+                            "进度应实时上报（第一条 %.3fs < 总耗时 %.3fs）" % (events[0][0], elapsed))
+
+    @unittest.skipIf(MKVMERGE is None, "未安装 mkvmerge")
+    def test_run_command_streams_lines(self):
+        """run_command 的 on_line 应在运行过程中被调用。"""
+        from subfontmkv.mux import run_command
+
+        lines = []
+        run_command([MKVMERGE, "--version"], capture=True,
+                    on_line=lambda line, stream: lines.append(line))
+        self.assertTrue(any("mkvmerge" in ln for ln in lines), lines)
+
+
+# ==========================================================================
 # 辅助函数
 # ==========================================================================
 class TestCollectVideos(unittest.TestCase):

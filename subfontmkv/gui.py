@@ -312,7 +312,11 @@ class SubFontMKVApp(object):
     def _handle_ui_event(self, event: tuple) -> None:
         kind = event[0]
         if kind == "progress":
-            self._update_progress(event[1], event[2])
+            # (序号, 总数, 是否只是开始)
+            self._update_progress(event[1], event[2], len(event) > 3 and event[3])
+        elif kind == "file-progress":
+            # (百分比, 文件名, 序号, 总数)
+            self._update_file_progress(event[1], event[2], event[3], event[4])
         elif kind == "finished":
             self._on_finished(event[1])
         elif kind == "failed":
@@ -689,7 +693,7 @@ class SubFontMKVApp(object):
         self.stop_flag.clear()
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.progress.configure(maximum=len(paths), value=0)
+        self.progress.configure(maximum=len(paths) * 100, value=0)
         self._log("-" * 70, INFO)
         self._log("开始处理 {0} 个视频…".format(len(paths)), INFO)
         self.worker = threading.Thread(
@@ -700,12 +704,18 @@ class SubFontMKVApp(object):
     def _run_worker(self, paths: List[str], options: core.Options) -> None:
         """工作线程：只做计算，界面更新一律通过队列交给主线程。"""
 
-        def on_event(kind: str, job: core.Job, index: int, total: int) -> None:
+        def on_event(kind: str, job: core.Job, index: int, total: int, extra=None) -> None:
+            if kind == "file-progress":
+                # 只把百分比送到界面（日志行由 core 里的 log.progress 输出）
+                self.ui_queue.put(("file-progress", extra, os.path.basename(job.video),
+                                   index, total))
+                return
             if kind == "done":
                 level = INFO if job.status in ("ok", "dry-run") else WARNING
                 self.log_queue.put((
                     "  -> {0}: {1}".format(job.status, job.output or job.message), level))
-            self.ui_queue.put(("progress", index, total))
+            # kind == "start" 时进度只走到 index-1，避免未开始就显示完成
+            self.ui_queue.put(("progress", index, total, kind == "start"))
 
         try:
             set_level(DEBUG)
@@ -715,12 +725,30 @@ class SubFontMKVApp(object):
         except Exception as exc:
             self.ui_queue.put(("failed", exc))
 
-    def _update_progress(self, index: int, total: int) -> None:
-        self.progress.configure(maximum=total, value=index)
+    # 进度条统一用「文件数 × 100」作刻度：每个文件占 100 格，
+    # 这样封装过程中的单文件百分比可以连续地反映到整条进度上。
+    def _set_progress(self, value: int, total: int) -> None:
+        total = max(total, 1)
+        self.progress.configure(maximum=total * 100,
+                                value=max(0, min(total * 100, value)))
+
+    def _update_progress(self, index: int, total: int, started: bool = False) -> None:
+        """进度按整文件推进：开始时算 index-1 个，结束时算 index 个。"""
+        self._set_progress((index - (1 if started else 0)) * 100, total)
         self.status_var.set("正在处理 {0}/{1}".format(index, total))
+
+    def _update_file_progress(self, percent: int, name: str, index: int, total: int) -> None:
+        """封装过程中的实时百分比。"""
+        self._set_progress((index - 1) * 100 + percent, total)
+        self.status_var.set("正在处理 {0}/{1} — {2}  {3}%".format(
+            index, total, name, percent))
+
+    def _finish_progress(self) -> None:
+        self.progress.configure(value=self.progress["maximum"])
 
     def _on_finished(self, summary) -> None:
         set_level(INFO)
+        self._finish_progress()
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.status_var.set("完成: 成功 {0} / 跳过 {1} / 失败 {2}".format(

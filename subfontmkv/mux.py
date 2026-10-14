@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import subprocess
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from .fonts import font_mime_type
 from .log import get_logger
@@ -142,11 +142,22 @@ class MkvmergeMuxer(Muxer):
         args.extend(["-o", os.path.abspath(output)])
         return args
 
-    def mux(self, **kwargs) -> "MuxResult":
+    def mux(self, on_progress=None, **kwargs) -> "MuxResult":
         output = kwargs["output"]
         args = self.build_command(**kwargs)
         log.debug("mkvmerge 参数: %s", args)
-        result = run_command([self.executable] + args)
+
+        def handle_line(line: str, _stream: str) -> None:
+            if on_progress is None:
+                return
+            percent = parse_progress(line)
+            if percent is not None:
+                try:
+                    on_progress(percent, line)
+                except Exception:
+                    pass
+
+        result = run_command([self.executable] + args, on_line=handle_line)
         if result.returncode not in (0, 1):
             raise MuxError("mkvmerge 失败（返回码 {0}）\n{1}".format(
                 result.returncode, _tail(result.stderr or result.stdout)))
@@ -210,7 +221,7 @@ class FfmpegMuxer(Muxer):
         args.extend(["-f", "matroska", os.path.abspath(output)])
         return args
 
-    def mux(self, **kwargs) -> "MuxResult":
+    def mux(self, on_progress=None, **kwargs) -> "MuxResult":
         output = kwargs["output"]
         args = self.build_command(**kwargs)
         log.debug("ffmpeg 参数: %s", args)
@@ -246,31 +257,92 @@ class CommandResult(object):
         self.stderr = stderr
 
 
-def run_command(args: Sequence[str], capture: bool = False) -> CommandResult:
-    """用 subprocess 运行外部程序，杜绝 shell 引号转义问题。"""
+def run_command(
+    args: Sequence[str],
+    capture: bool = False,
+    on_line=None,
+    echo: bool = True,
+) -> CommandResult:
+    """用 subprocess 运行外部程序，杜绝 shell 引号转义问题。
+
+    逐行读取输出，因此可以：
+      * 通过 on_line(line, stream) 实时上报进度（而不是等进程结束才拿到全部输出）；
+      * 通过 echo=True 把每一行实时写进日志。
+    两个管道各用一个线程读取，避免子进程写满某个管道后被阻塞。
+    """
+    import threading
+
     kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(args),
             stdin=subprocess.DEVNULL,
             universal_newlines=True,
             encoding="utf-8",
             errors="replace",
+            bufsize=1,
             **kwargs
         )
     except FileNotFoundError:
         raise MuxError("找不到可执行文件: {0}".format(args[0]))
     except OSError as exc:
         raise MuxError("无法执行 {0}: {1}".format(args[0], exc))
-    out = completed.stdout or ""
-    err = completed.stderr or ""
-    if not capture:
-        for line in (out + err).splitlines():
-            if line.strip():
-                log.debug("  %s", line)
-    return CommandResult(completed.returncode, out, err)
+
+    collected = {"stdout": [], "stderr": []}
+    lock = threading.Lock()
+
+    def pump(stream, name: str) -> None:
+        if stream is None:
+            return
+        try:
+            for raw in stream:
+                line = raw.rstrip("\r\n")
+                with lock:
+                    collected[name].append(line)
+                if on_line is not None:
+                    try:
+                        on_line(line, name)
+                    except Exception:
+                        pass
+                if not capture and echo and line.strip():
+                    log.debug("  %s", line)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [
+        threading.Thread(target=pump, args=(process.stdout, "stdout"), daemon=True),
+        threading.Thread(target=pump, args=(process.stderr, "stderr"), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    returncode = process.wait()
+    for thread in threads:
+        thread.join()
+
+    out = "\n".join(collected["stdout"])
+    err = "\n".join(collected["stderr"])
+    return CommandResult(returncode, out, err)
+
+
+#: mkvmerge 的两种进度输出：普通模式 "Progress: 42%"，--gui-mode "#GUI#progress 42%"
+RE_PROGRESS = re.compile(r"(?:Progress:\s*|#GUI#progress\s*)(-?\d{1,4})\s*%")
+
+
+def parse_progress(line: str) -> Optional[int]:
+    """从一行输出里解析百分比；不是进度行则返回 None。"""
+    match = RE_PROGRESS.search(line or "")
+    if not match:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return max(0, min(100, value))
 
 
 def _tail(text: str, lines: int = 15) -> str:

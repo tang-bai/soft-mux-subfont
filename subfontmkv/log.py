@@ -74,9 +74,9 @@ class Logger(object):
     def error(self, message: str, *args) -> None:
         self._emit(ERROR, self._format(message, args))
 
-    def progress(self, message: str) -> None:
+    def progress(self, message: str, *args) -> None:
         """进度提示：与 info 同级别，但便于 GUI 单独着色。"""
-        self._emit(INFO, message)
+        self._emit(INFO, self._format(message, args))
 
     @staticmethod
     def _format(message: str, args) -> str:

@@ -421,7 +421,12 @@ class Processor(object):
         return candidate
 
     # -- 单个任务 -----------------------------------------------------------
-    def process(self, job: Job) -> Job:
+    def process(self, job: Job, on_progress=None) -> Job:
+        """处理一个任务。
+
+        on_progress(percent, label) 会在封装过程中被实时调用，用于显示进度；
+        label 是当前阶段说明（例如 "封装中"）。
+        """
         if self.muxer is None:
             self.setup()
         assert self.muxer is not None
@@ -504,8 +509,23 @@ class Processor(object):
         # 3. 封装
         output = self.output_path(job)
         title = job.stem if self.options.title_from_filename else None
+        # mkvmerge 的进度回调可能来自读取子进程输出的线程，这里只做转发，
+        # 由调用方（GUI）负责把它丢进队列、回到主线程更新界面。
+        progress_cb = None
+        last = [-1]
+
+        def report(percent: int, _line: str = "") -> None:
+            if percent == last[0]:
+                return
+            last[0] = percent
+            if on_progress is not None:
+                on_progress(percent, "封装中")
+
+        if on_progress is not None:
+            progress_cb = report
         try:
             result = self.muxer.mux(
+                on_progress=progress_cb,
                 video=job.video,
                 output=output,
                 subtitles=rewritten,
@@ -563,7 +583,10 @@ def run(
 ) -> Dict[str, object]:
     """处理一批目标，返回统计结果。
 
-    on_event(kind, job, index, total) 会在每个任务开始/结束时被调用，
+    on_event(kind, job, index, total, extra) 会在以下时机被调用：
+      * ("start",  job, index, total, None)        开始处理某个视频
+      * ("file-progress", job, index, total, pct)  该视频内部的封装百分比（0-100）
+      * ("done",   job, index, total, None)        某个视频处理结束
     should_stop() 返回 True 时会在当前文件处理完后中断（供 GUI 的「停止」使用）。
     """
     videos = collect_videos(targets, options.recursive, options.suffix)
@@ -581,10 +604,19 @@ def run(
                 break
             log.info("[%d/%d] %s", index, len(videos), os.path.basename(video))
             job = Job(video)
+            name = os.path.basename(video)
             if on_event is not None:
-                on_event("start", job, index, len(videos))
+                on_event("start", job, index, len(videos), None)
+
+            def report(percent: int, label: str = "封装中",
+                       _job=job, _index=index, _name=name) -> None:
+                # 命令行下 log.progress 直接打到 stdout，GUI 下只把百分比丢进队列
+                log.progress("  %s %s %d%%", _name, label, percent)
+                if on_event is not None:
+                    on_event("file-progress", _job, _index, len(videos), percent)
+
             try:
-                processor.process(job)
+                processor.process(job, on_progress=report)
             except Exception as exc:  # 单个任务失败不应中断整批
                 job.status = "failed"
                 job.message = str(exc)
@@ -595,7 +627,7 @@ def run(
             summary[counter_key] += 1  # type: ignore[operator]
             summary["jobs"].append(job)  # type: ignore[union-attr]
             if on_event is not None:
-                on_event("done", job, index, len(videos))
+                on_event("done", job, index, len(videos), None)
     finally:
         processor.cleanup()
 

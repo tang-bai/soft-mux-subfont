@@ -231,11 +231,31 @@ batch_dt = time.perf_counter() - t0
 print("19 批量写入 2000 行日志: %.3fs" % batch_dt)
 assert batch_dt < 0.5, "批量写入过慢: %.3fs" % batch_dt
 
+# ---- 实时进度：进度条刻度 & 状态栏百分比 ----
+app.progress.configure(maximum=300, value=0)
+app._update_file_progress(45, "Show.mkv", 2, 3)
+assert app.progress["value"] == 145, app.progress["value"]
+assert "2/3" in app.status_var.get() and "45%" in app.status_var.get(), app.status_var.get()
+print("20 单文件进度折算 OK（第 2/3 个文件的 45%% -> 进度条 %d/%d，状态栏 %r）"
+      % (app.progress["value"], app.progress["maximum"], app.status_var.get()))
+
+# start 事件只推进到 index-1，结束时才补齐，避免未开始就显示完成
+app.progress.configure(maximum=300, value=0)
+app._update_progress(2, 3, True)
+assert app.progress["value"] == 100, app.progress["value"]
+app._update_progress(2, 3, False)
+assert app.progress["value"] == 200, app.progress["value"]
+print("21 整文件进度推进 OK（开始 %d -> 结束 %d）" % (100, app.progress["value"]))
+
+app._finish_progress()
+assert app.progress["value"] == app.progress["maximum"]
+print("22 完成后进度条填满 OK")
+
 # 界面确实能渲染（不弹窗，只做一次布局计算）
 root2 = tk.Tk(); root2.withdraw()
 app2 = gui.SubFontMKVApp(root2)
 root2.update_idletasks()
-print("20 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
+print("23 界面布局计算 OK, 列表列数 =", len(app2.tree["columns"]))
 root2.destroy()
 shutil.rmtree(drop_dir, ignore_errors=True)
 root.destroy()
