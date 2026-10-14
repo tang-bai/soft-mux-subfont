@@ -1,0 +1,5 @@
+fonttools>=4.30
+# 可选：拖拽添加文件（图形界面）
+# tkinterdnd2>=0.3
+# 可选：更准确的字幕编码识别（未安装时退回 chardet）
+# chardet>=4.0

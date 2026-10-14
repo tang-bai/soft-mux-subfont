@@ -1,0 +1,17 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- 第三方基础项目快照（用 tools/fetch_base.py 重新拉取，不入库） ---
+third_party/
+
+# --- 生成的测试素材（合成视频与字体，用 tools/ 下的脚本重新生成） ---
+/test-assets/
+
+# --- 本工具的产物 ---
+*.subfont.mkv
+*.full.mkv
+*.log
